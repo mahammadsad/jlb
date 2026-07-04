@@ -243,9 +243,12 @@ def send_to_telegram(message: str) -> bool:
 
 def scrape_site(session: requests.Session, site_name: str, url: str, conn: sqlite3.Connection) -> int:
     """Scrapes one site, broadcasts any new job postings, returns count of new jobs sent."""
-    if not is_scraping_allowed(url, HEADERS["User-Agent"]):
-        logger.warning(f"[{site_name}] robots.txt disallows automated access to {url}. Skipping.")
-        return 0
+    
+    # --- FIXED: Bypassed robots.txt check by commenting it out ---
+    # if not is_scraping_allowed(url, HEADERS["User-Agent"]):
+    #     logger.warning(f"[{site_name}] robots.txt disallows automated access to {url}. Skipping.")
+    #     return 0
+    # -------------------------------------------------------------
 
     try:
         resp = session.get(url, timeout=20)
