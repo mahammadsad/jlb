@@ -37,6 +37,23 @@ from urllib.robotparser import RobotFileParser
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.ssl_ import create_urllib3_context
+
+
+class LegacyTLSAdapter(HTTPAdapter):
+    """
+    Some Indian government servers run old/misconfigured TLS stacks that
+    refuse the "safe" renegotiation modern OpenSSL insists on by default.
+    This adapter opts into legacy renegotiation support -- it still does
+    FULL certificate verification, it just relaxes one negotiation rule
+    so we can complete a handshake with these specific servers.
+    """
+    def init_poolmanager(self, *args, **kwargs):
+        ctx = create_urllib3_context()
+        ctx.options |= 0x4  # SSL_OP_LEGACY_SERVER_CONNECT
+        kwargs["ssl_context"] = ctx
+        return super().init_poolmanager(*args, **kwargs)
 
 # --------------------------------------------------------------------------
 # Configuration
@@ -312,6 +329,7 @@ def main() -> None:
     conn = init_db()
     session = requests.Session()
     session.headers.update(HEADERS)
+    session.mount("https://", LegacyTLSAdapter())
 
     total_new = 0
     try:
