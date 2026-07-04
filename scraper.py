@@ -16,7 +16,6 @@ from bs4 import BeautifulSoup
 # Configuration
 # --------------------------------------------------------------------------
 
-# Switched to RSS feed for reliability and speed
 TARGET_SITES = [
     {"name": "Karmasandhan", "url": "https://www.karmasandhan.com/feed/"},
 ]
@@ -36,7 +35,6 @@ DB_FILE = "jobs.db"
 GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_ENDPOINT = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
-# Generous delay to protect the Gemini Free Tier limit
 GEMINI_RATE_LIMIT_DELAY = 10 
 
 logging.basicConfig(
@@ -79,7 +77,7 @@ def mark_job_seen(conn: sqlite3.Connection, url: str, title: str, source: str) -
 
 
 # --------------------------------------------------------------------------
-# Gemini AI Layer (Strict HTML Template + Circuit Breaker)
+# Gemini AI Layer
 # --------------------------------------------------------------------------
 
 def build_gemini_prompt(title: str, content: str) -> str:
@@ -105,6 +103,7 @@ COPY THIS TEMPLATE EXACTLY AND FILL IN THE BRACKETS:
 💰 <b>বেতন:</b> [Insert Salary/Pay Scale]
 📅 <b>আবেদনের শেষ তারিখ:</b> [Insert Application Deadline]
 📝 <b>আবেদন পদ্ধতি:</b> [Insert How to Apply (Online/Offline)]
+🔗 <b>অফিসিয়াল লিঙ্ক:</b> [Insert the raw https:// URL of the official government website or application link found in the details. Do NOT use HTML <a> tags. Just write the raw URL so it becomes clickable. If no official link is found, write "অফিসিয়াল ওয়েবসাইট দেখুন"]
 
 Output ONLY the filled HTML template."""
 
@@ -146,7 +145,6 @@ def generate_bengali_summary(title: str, content: str) -> str | None:
             logger.error(f"Gemini API parsing error on attempt {attempt}: {e}")
             time.sleep(5)
             
-    # Circuit Breaker Signal
     if resp is not None and resp.status_code == 429:
         return "RATE_LIMIT_EXHAUSTED"
         
@@ -182,7 +180,7 @@ def send_to_telegram(message: str) -> bool:
 
 
 # --------------------------------------------------------------------------
-# Scraping Layer (RSS XML Parser)
+# Scraping Layer (RSS XML Parser + Official Link Extractor)
 # --------------------------------------------------------------------------
 
 def scrape_site(session: requests.Session, site_name: str, url: str, conn: sqlite3.Connection) -> int:
@@ -193,7 +191,6 @@ def scrape_site(session: requests.Session, site_name: str, url: str, conn: sqlit
         logger.error(f"Failed to fetch {url}: {e}")
         return 0
 
-    # Parse as XML
     soup = BeautifulSoup(resp.content, "xml")
     items = soup.find_all("item")
     logger.info(f"[{site_name}] Scanned {len(items)} items in RSS feed.")
@@ -204,7 +201,6 @@ def scrape_site(session: requests.Session, site_name: str, url: str, conn: sqlit
     for item in items:
         title_tag = item.find("title")
         link_tag = item.find("link")
-        # Handle variations in RSS feed tags for the main content
         content_tag = item.find("content:encoded") or item.find("description")
         
         if not title_tag or not link_tag:
@@ -213,11 +209,6 @@ def scrape_site(session: requests.Session, site_name: str, url: str, conn: sqlit
         text = title_tag.text.strip()
         full_url = link_tag.text.strip()
         
-        # Strip HTML tags out of the description payload
-        article_text = ""
-        if content_tag:
-            article_text = BeautifulSoup(content_tag.text, "html.parser").get_text(separator="\n", strip=True)[:4000]
-
         if not any(kw in text.lower() for kw in KEYWORDS):
             continue
 
@@ -227,10 +218,39 @@ def scrape_site(session: requests.Session, site_name: str, url: str, conn: sqlit
         seen_this_run.add(full_url)
         logger.info(f"[{site_name}] Processing: {text[:80]}")
 
+        article_text = ""
+        if content_tag:
+            content_html = content_tag.text
+            article_soup = BeautifulSoup(content_html, "html.parser")
+            
+            # 1. Extract external links BEFORE stripping HTML
+            external_links = []
+            for a_tag in article_soup.find_all("a", href=True):
+                href = a_tag["href"].strip()
+                anchor_text = a_tag.get_text(strip=True)
+                
+                # Filter out aggregator internal links, social media, and junk
+                lower_href = href.lower()
+                if not href or href.startswith(("#", "javascript", "mailto")):
+                    continue
+                if any(junk in lower_href for junk in ["karmasandhan.com", "t.me", "facebook.com", "whatsapp", "twitter.com"]):
+                    continue
+                
+                external_links.append(f"{anchor_text}: {href}")
+            
+            # 2. Extract plain text
+            article_text = article_soup.get_text(separator="\n", strip=True)
+            
+            # 3. Append the extracted links to the text for Gemini to analyze
+            if external_links:
+                unique_links = list(dict.fromkeys(external_links))[:5] # Keep it to the top 5 unique links
+                article_text += "\n\nPOSSIBLE OFFICIAL LINKS FOUND:\n" + "\n".join(unique_links)
+
+        article_text = article_text[:4000]
+
         bengali_message = generate_bengali_summary(text, article_text)
         time.sleep(GEMINI_RATE_LIMIT_DELAY)
 
-        # Catch the circuit breaker signal
         if bengali_message == "RATE_LIMIT_EXHAUSTED":
             logger.error("API quota exhausted. Halting the scraper to save GitHub Actions minutes.")
             return new_jobs_sent
@@ -239,7 +259,6 @@ def scrape_site(session: requests.Session, site_name: str, url: str, conn: sqlit
             logger.warning(f"Gemini failed for '{text[:50]}'; will retry next run.")
             continue
 
-        # Post to Telegram
         if send_to_telegram(bengali_message):
             mark_job_seen(conn, full_url, text, site_name)
             new_jobs_sent += 1
