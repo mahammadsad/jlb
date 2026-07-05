@@ -16,6 +16,26 @@ FIXES applied vs. the original draft (search "# FIX:" for each spot):
   7. Exponential backoff on 429s (text + image) and a per-run item cap
      (MAX_JOBS_PER_RUN) so a feed backlog can't exhaust the whole quota
      in a single run. All tunable via env vars -- see .env.example.
+  8. gemini-2.5-flash has "dynamic thinking" ON by default, and thinking
+     tokens are drawn from the SAME maxOutputTokens budget as the actual
+     answer. For a simple structured-extraction task this was silently
+     eating most of the 800-token budget, leaving too little room to
+     finish the JSON object -> "Unterminated string" parse errors, which
+     then burned extra retries and helped trip the rate limit. Thinking
+     is now explicitly disabled for this call, and maxOutputTokens raised
+     as a safety margin. 429 responses now also log the response body so
+     RPM/TPM/RPD can be told apart from the logs alone.
+  9. Free-tier Gemini text quota for this project is very tight (checked
+     in AI Studio -> Rate Limit: 5 RPM, 20 RPD). RPD resets at midnight
+     PACIFIC time specifically, not UTC/local, and once it's gone no
+     amount of backoff helps until the reset. Rather than discover this
+     via repeated 429s, the script now keeps its own persistent, Pacific-
+     time-aware counter of Gemini text calls (stored in jobs.db) and
+     proactively stops calling Gemini once GEMINI_DAILY_TEXT_LIMIT is hit
+     for the day -- deferring remaining jobs to the next run/day using
+     the same safe "leave unmarked, retry later" pattern already used for
+     429s. This keeps the whole pipeline inside the free tier without
+     needing to link a billing account.
 """
 
 import base64
@@ -26,6 +46,8 @@ import os
 import re
 import sqlite3
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo  # stdlib since Python 3.9, no extra install needed
 
 import requests
 from bs4 import BeautifulSoup
@@ -62,20 +84,26 @@ GEMINI_IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-imag
 GEMINI_TEXT_ENDPOINT = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_TEXT_MODEL}:generateContent"
 GEMINI_IMAGE_ENDPOINT = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_IMAGE_MODEL}:generateContent"
 
-# FIX #7: tunable rate-limit handling. Free-tier Gemini keys often allow only
-# a handful of requests per minute, so a flat "sleep 10s, retry 3x" pattern
-# can fail every single time once you're throttled. These are now:
+# FIX #7: tunable rate-limit handling. These are:
 #   - GEMINI_RATE_LIMIT_DELAY: pause between *successful* calls, to avoid
-#     tripping the limit in the first place. Try 30-60 for free-tier keys.
+#     tripping the per-minute limit in the first place.
 #   - GEMINI_RETRY_BASE_DELAY + GEMINI_MAX_RETRIES: exponential backoff when
 #     a 429 does happen (base * 2^(attempt-1): e.g. 20s, 40s, 80s).
-#   - MAX_JOBS_PER_RUN: caps how many new items are processed per run, so a
-#     backlog of 50 feed items doesn't burn your whole daily quota in one go.
+#   - MAX_JOBS_PER_RUN: caps how many new items are processed per run.
 #     Unprocessed items are simply left unmarked and picked up next run.
 GEMINI_RATE_LIMIT_DELAY = int(os.environ.get("GEMINI_RATE_LIMIT_DELAY", "20"))
 GEMINI_RETRY_BASE_DELAY = int(os.environ.get("GEMINI_RETRY_BASE_DELAY", "20"))
 GEMINI_MAX_RETRIES = int(os.environ.get("GEMINI_MAX_RETRIES", "3"))
 MAX_JOBS_PER_RUN = int(os.environ.get("MAX_JOBS_PER_RUN", "5"))
+
+# FIX #9: self-enforced daily budget for Gemini TEXT calls, matching your
+# free-tier project's observed RPD in https://aistudio.google.com/rate-limit
+# (5 RPM / 20 RPD at time of writing). Adjust if your dashboard shows a
+# different number, or lower it a bit (e.g. 18) if you want a safety
+# margin. Google resets RPD at midnight PACIFIC time, hence the timezone
+# handling below rather than just using UTC or the server's local clock.
+GEMINI_DAILY_TEXT_LIMIT = int(os.environ.get("GEMINI_DAILY_TEXT_LIMIT", "20"))
+PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -101,6 +129,17 @@ def init_db() -> sqlite3.Connection:
         )
         """
     )
+    # FIX #9: persistent, Pacific-date-keyed counter of Gemini TEXT calls,
+    # so the free-tier daily budget survives across separate GitHub Actions
+    # runs (each run is a fresh process with no in-memory state otherwise).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS gemini_usage (
+            usage_date TEXT PRIMARY KEY,
+            text_calls INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
     conn.commit()
     return conn
 
@@ -114,6 +153,32 @@ def mark_job_seen(conn: sqlite3.Connection, url: str, title: str, source: str) -
         (url, title, source),
     )
     conn.commit()
+
+def _pacific_today_str() -> str:
+    return datetime.now(PACIFIC_TZ).strftime("%Y-%m-%d")
+
+def get_text_calls_today(conn: sqlite3.Connection) -> int:
+    """FIX #9: how many Gemini text calls have been made since the last
+    Pacific-midnight reset, per our own persistent tracking."""
+    cur = conn.execute(
+        "SELECT text_calls FROM gemini_usage WHERE usage_date = ?",
+        (_pacific_today_str(),),
+    )
+    row = cur.fetchone()
+    return row[0] if row else 0
+
+def increment_text_calls_today(conn: sqlite3.Connection) -> int:
+    """FIX #9: record that we're about to make one real Gemini text call."""
+    today = _pacific_today_str()
+    conn.execute(
+        """
+        INSERT INTO gemini_usage (usage_date, text_calls) VALUES (?, 1)
+        ON CONFLICT(usage_date) DO UPDATE SET text_calls = text_calls + 1
+        """,
+        (today,),
+    )
+    conn.commit()
+    return get_text_calls_today(conn)
 
 
 # --------------------------------------------------------------------------
@@ -154,8 +219,9 @@ For any text field where the detail is genuinely not present, use the Bengali
 string "বিজ্ঞপ্তি দেখুন". Do not translate or alter the official_link value."""
 
 
-def extract_job_fields(title: str, content: str) -> dict | str | None:
-    """Returns a dict of fields, the sentinel string "RATE_LIMIT_EXHAUSTED", or None on failure."""
+def extract_job_fields(title: str, content: str, conn: sqlite3.Connection) -> dict | str | None:
+    """Returns a dict of fields, one of the sentinel strings
+    "RATE_LIMIT_EXHAUSTED" / "DAILY_BUDGET_REACHED", or None on failure."""
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         logger.error("GEMINI_API_KEY is not set.")
@@ -165,19 +231,44 @@ def extract_job_fields(title: str, content: str) -> dict | str | None:
         "contents": [{"parts": [{"text": build_gemini_prompt(title, content)}]}],
         "generationConfig": {
             "temperature": 0.2,
-            "maxOutputTokens": 800,
+            # FIX #8: raised from 800 -> 1500. TPM headroom is huge, so this
+            # costs nothing, but gives real output room to breathe.
+            "maxOutputTokens": 1500,
             "responseMimeType": "application/json",
+            # FIX #8: gemini-2.5-flash has dynamic thinking ON by default,
+            # and those thinking tokens come out of maxOutputTokens BEFORE
+            # the actual JSON is written. Disabling it fixes the truncated-
+            # JSON errors and also uses less quota per call.
+            "thinkingConfig": {"thinkingBudget": 0},
         },
     }
 
     resp = None
     for attempt in range(1, GEMINI_MAX_RETRIES + 1):
+        # FIX #9: proactively stop BEFORE spending an attempt if we've
+        # already used up today's self-tracked free-tier budget, instead
+        # of finding out via another 429.
+        calls_today = get_text_calls_today(conn)
+        if calls_today >= GEMINI_DAILY_TEXT_LIMIT:
+            logger.warning(
+                f"Free-tier daily text budget reached ({calls_today}/{GEMINI_DAILY_TEXT_LIMIT} "
+                f"calls since the last Pacific-midnight reset). Stopping before attempt {attempt}."
+            )
+            return "DAILY_BUDGET_REACHED"
+
         try:
+            increment_text_calls_today(conn)
             resp = requests.post(f"{GEMINI_TEXT_ENDPOINT}?key={api_key}", json=payload, timeout=30)
 
             if resp.status_code == 429:
                 backoff = GEMINI_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                logger.warning(f"Attempt {attempt}/{GEMINI_MAX_RETRIES}: Gemini text generation rate-limited (429). Sleeping {backoff}s...")
+                # FIX #8: log the actual response body. Gemini's 429 payload
+                # distinguishes RPM/TPM (short-lived, backoff is correct)
+                # from RPD (daily cap, resets at midnight Pacific).
+                logger.warning(
+                    f"Attempt {attempt}/{GEMINI_MAX_RETRIES}: Gemini text generation "
+                    f"rate-limited (429): {resp.text[:300]}. Sleeping {backoff}s..."
+                )
                 time.sleep(backoff)
                 continue
 
@@ -206,10 +297,10 @@ def extract_job_fields(title: str, content: str) -> dict | str | None:
 
         except json.JSONDecodeError as e:
             logger.error(f"Gemini did not return valid JSON on attempt {attempt}: {e}")
-            time.sleep(5)
+            time.sleep(10)
         except (requests.exceptions.RequestException, KeyError, IndexError, ValueError) as e:
             logger.error(f"Gemini Text API parsing error on attempt {attempt}: {e}")
-            time.sleep(5)
+            time.sleep(10)
 
     if resp is not None and resp.status_code == 429:
         return "RATE_LIMIT_EXHAUSTED"
@@ -268,9 +359,11 @@ def generate_job_image(title: str, content: str) -> bytes | None:
         }
     }
 
-    # Image generation shares the same Gemini quota, so it gets the same
-    # exponential backoff treatment -- but capped at 2 attempts since the
-    # image is best-effort (the text message still gets sent without one).
+    # Image generation uses a separate quota bucket from the text model
+    # ("Nano Banana" in AI Studio's Rate Limit page), so it's tracked
+    # independently and shares the same exponential backoff treatment --
+    # but capped at 2 attempts since the image is best-effort (the text
+    # message still gets sent without one).
     image_max_retries = min(GEMINI_MAX_RETRIES, 2)
     for attempt in range(1, image_max_retries + 1):
         try:
@@ -278,7 +371,10 @@ def generate_job_image(title: str, content: str) -> bytes | None:
 
             if resp.status_code == 429:
                 backoff = GEMINI_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                logger.warning(f"Attempt {attempt}/{image_max_retries}: Gemini Image API rate-limited (429). Sleeping {backoff}s...")
+                logger.warning(
+                    f"Attempt {attempt}/{image_max_retries}: Gemini Image API rate-limited (429): "
+                    f"{resp.text[:300]}. Sleeping {backoff}s..."
+                )
                 time.sleep(backoff)
                 continue
 
@@ -382,6 +478,15 @@ def scrape_site(session: requests.Session, site_name: str, url: str, conn: sqlit
     items = soup.find_all("item")
     logger.info(f"[{site_name}] Scanned {len(items)} items in RSS feed.")
 
+    # FIX #9: surface today's budget status once at the top of each run,
+    # so it's visible in the log even if every item gets skipped for
+    # other reasons (already-seen, keyword mismatch, etc.).
+    calls_today = get_text_calls_today(conn)
+    logger.info(
+        f"Gemini text budget today (since last Pacific-midnight reset): "
+        f"{calls_today}/{GEMINI_DAILY_TEXT_LIMIT} used."
+    )
+
     seen_this_run = set()
     new_jobs_sent = 0
     processed_this_run = 0  # FIX #7: counts toward MAX_JOBS_PER_RUN
@@ -449,12 +554,20 @@ def scrape_site(session: requests.Session, site_name: str, url: str, conn: sqlit
             article_text = article_text[:4000]
 
             # Extract structured fields via Gemini
-            fields = extract_job_fields(text, article_text)
-            time.sleep(GEMINI_RATE_LIMIT_DELAY)
+            fields = extract_job_fields(text, article_text, conn)
 
             if fields == "RATE_LIMIT_EXHAUSTED":
-                logger.error("API quota exhausted. Halting scraper run.")
+                logger.error("Gemini rate-limited us (429) past our retries. Halting scraper run.")
                 return new_jobs_sent, True
+
+            if fields == "DAILY_BUDGET_REACHED":
+                logger.error(
+                    "Free-tier daily text budget reached. Halting scraper run; remaining "
+                    "items will be retried after the next Pacific-midnight quota reset."
+                )
+                return new_jobs_sent, True
+
+            time.sleep(GEMINI_RATE_LIMIT_DELAY)
 
             if not fields:
                 logger.warning(f"Gemini extraction failed for '{text[:50]}'; skipping.")
