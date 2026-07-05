@@ -36,6 +36,22 @@ FIXES applied vs. the original draft (search "# FIX:" for each spot):
      the same safe "leave unmarked, retry later" pattern already used for
      429s. This keeps the whole pipeline inside the free tier without
      needing to link a billing account.
+  10. WEST BENGAL ELIGIBILITY FILTER. Many recruitment notices on this feed
+      are state PSC / state government posts that are only open to
+      residents/domicile-holders of ONE particular state (e.g. an MP or
+      Rajasthan state government vacancy) -- useless to broadcast to a WB
+      exam-aspirant audience, since they cannot actually apply. Gemini now
+      also returns an "eligibility_scope" field alongside the other job
+      fields (ALL_INDIA / WEST_BENGAL / OTHER_STATE_ONLY / UNCLEAR), using
+      the SAME text call already spent on field extraction -- so this costs
+      zero extra Gemini quota. Jobs classified as ALL_INDIA (central govt,
+      banking, railways, defence, PSU, or a state job explicitly open to
+      all-India applicants) or WEST_BENGAL (WB's own state jobs) are
+      broadcast as before. Anything classified OTHER_STATE_ONLY or UNCLEAR
+      is skipped -- and skipped BEFORE the quota-expensive image-generation
+      step ever runs. Skipped items are marked "seen" immediately (their
+      eligibility isn't going to change on a future run), so we never waste
+      a future Gemini call re-checking the same notice.
 """
 
 import base64
@@ -189,13 +205,25 @@ def increment_text_calls_today(conn: sqlite3.Connection) -> int:
 # string. This means Python (not the model) controls exactly how the final
 # Telegram message is assembled and escaped -- no more trusting an LLM to
 # never forget to escape a URL or insert stray text.
+# FIX #10: "eligibility_scope" / "eligibility_reason" added so the same call
+# also tells us whether this job is actually usable by a West Bengal
+# audience, at no extra Gemini quota cost.
 JOB_FIELD_KEYS = [
     "department", "post_name", "total_vacancies", "qualifications",
     "age_limit", "salary", "deadline", "apply_mode", "official_link",
+    "eligibility_scope", "eligibility_reason",
 ]
 
+# FIX #10: only these eligibility_scope values are actually worth showing to
+# this channel's West Bengal audience. Anything else (OTHER_STATE_ONLY,
+# UNCLEAR, or a missing/malformed value) gets filtered out -- see
+# is_eligible_for_wb() below.
+WB_RELEVANT_SCOPES = {"ALL_INDIA", "WEST_BENGAL"}
+
 def build_gemini_prompt(title: str, content: str) -> str:
-    return f"""You are analyzing a West Bengal government job recruitment notice.
+    return f"""You are analyzing a West Bengal government job recruitment notice for a
+Telegram channel whose audience is students in West Bengal preparing for
+competitive government exams.
 
 TITLE: {title}
 DETAILS: {content}
@@ -214,6 +242,28 @@ Keys (use exactly these):
 - "apply_mode": how to apply (online/offline), in Bengali
 - "official_link": the single most relevant raw https:// URL for the official
   notification or application form. If none is found, use an empty string.
+- "eligibility_scope": classify WHO is allowed to apply, using exactly one of
+  these four values:
+    * "ALL_INDIA" - a central government / all-India recruitment (UPSC, SSC,
+      Railways, Banking/IBPS/SBI, Defence, PSU, etc.), OR a state-level job
+      that explicitly says candidates from any state/domicile may apply
+      (i.e. NOT restricted to residents of just one state).
+    * "WEST_BENGAL" - a West Bengal state government job (WBPSC, WBSSC, WBP,
+      WB Panchayat, WB Health Recruitment Board, etc.).
+    * "OTHER_STATE_ONLY" - a job that is a state government / state PSC
+      recruitment for a state OTHER than West Bengal, where eligibility is
+      restricted to permanent residents/domicile-holders of that one state
+      (e.g. an MP, Rajasthan, UP, Bihar state government or state PSC post).
+      Use this classification for such state-specific posts even if the
+      notice doesn't say the word "domicile" verbatim -- state PSC / state
+      departmental recruitment is domicile-restricted by default unless the
+      notice explicitly says otherwise.
+    * "UNCLEAR" - you cannot confidently tell which of the above applies from
+      the given text.
+  Base this only on the recruiting body and any eligibility text present --
+  do not guess purely from the job title.
+- "eligibility_reason": ONE short sentence in English explaining why you
+  picked that eligibility_scope. Internal logging only, not shown to users.
 
 For any text field where the detail is genuinely not present, use the Bengali
 string "বিজ্ঞপ্তি দেখুন". Do not translate or alter the official_link value."""
@@ -306,6 +356,26 @@ def extract_job_fields(title: str, content: str, conn: sqlite3.Connection) -> di
         return "RATE_LIMIT_EXHAUSTED"
 
     return None
+
+
+def is_eligible_for_wb(fields: dict) -> bool:
+    """FIX #10: True only if Gemini classified this notice as either an
+    all-India / central recruitment, or a West Bengal state job. A job
+    classified "OTHER_STATE_ONLY" (a state PSC/state government post
+    restricted to that other state's own domicile-holders, e.g. an MP or
+    Rajasthan state-only vacancy) is not something a WB student can actually
+    apply to, so it's filtered out here -- before we spend anything on
+    building a message or generating a banner image for it.
+
+    "UNCLEAR" (or a missing/unexpected value) is also treated as NOT
+    eligible. This fails closed on purpose: it's better to silently skip a
+    possibly-relevant post than to broadcast a job WB students may not even
+    qualify for. If you notice too many false negatives in the logs, tune
+    the eligibility_scope instructions in build_gemini_prompt() rather than
+    loosening this check.
+    """
+    scope = str(fields.get("eligibility_scope") or "").strip().upper()
+    return scope in WB_RELEVANT_SCOPES
 
 
 def build_telegram_message(fields: dict) -> str:
@@ -553,7 +623,7 @@ def scrape_site(session: requests.Session, site_name: str, url: str, conn: sqlit
 
             article_text = article_text[:4000]
 
-            # Extract structured fields via Gemini
+            # Extract structured fields (incl. eligibility_scope) via Gemini
             fields = extract_job_fields(text, article_text, conn)
 
             if fields == "RATE_LIMIT_EXHAUSTED":
@@ -571,6 +641,22 @@ def scrape_site(session: requests.Session, site_name: str, url: str, conn: sqlit
 
             if not fields:
                 logger.warning(f"Gemini extraction failed for '{text[:50]}'; skipping.")
+                continue
+
+            # FIX #10: skip jobs that West Bengal students can't actually
+            # apply to (e.g. another state's domicile-restricted PSC post),
+            # BEFORE spending anything on image generation or Telegram.
+            # Mark as seen right away -- this is a permanent classification,
+            # not a transient failure, so there's no reason to re-check it
+            # (and re-spend a Gemini call on it) on a future run.
+            if not is_eligible_for_wb(fields):
+                scope = fields.get("eligibility_scope", "UNCLEAR") or "UNCLEAR"
+                reason = (fields.get("eligibility_reason") or "").strip() or "no reason given"
+                logger.info(
+                    f"[{site_name}] Skipping '{text[:60]}' - not usable by WB students "
+                    f"(eligibility_scope={scope}; {reason})"
+                )
+                mark_job_seen(conn, full_url, text, site_name)
                 continue
 
             bengali_message = build_telegram_message(fields)
