@@ -1,57 +1,76 @@
 #!/usr/bin/env python3
 """
-WB Government Job Scraper (RSS) -> Gemini AI (Text & Image) -> Telegram
+WB Government Job Scraper (RSS) -> Groq (Text/JSON) + Gemini (Image) -> Telegram
 ==============================================================================
 Scrapes government job feeds, extracts details, generates a Bengali HTML summary
 and a modern AI banner card, and broadcasts both to a Telegram channel.
 
 FIXES applied vs. the original draft (search "# FIX:" for each spot):
   1. Telegram HTML-escaping bug that broke on any job link containing "&".
-  2. Gemini now returns structured JSON instead of pre-built HTML, so the
-     Python code controls escaping/formatting instead of trusting the model.
+  2. The text model now returns structured JSON instead of pre-built HTML, so
+     the Python code controls escaping/formatting instead of trusting the model.
   3. DB path anchored to the script's own directory (safe for cron).
-  4. Gemini model names are env-overridable (Google renames/retires these often).
+  4. Text/image model names are env-overridable (providers rename/retire these).
   5. Global quota short-circuit across multiple feeds.
   6. Per-item try/except so one bad item can't crash the whole run.
   7. Exponential backoff on 429s (text + image) and a per-run item cap
      (MAX_JOBS_PER_RUN) so a feed backlog can't exhaust the whole quota
      in a single run. All tunable via env vars -- see .env.example.
-  8. gemini-2.5-flash has "dynamic thinking" ON by default, and thinking
-     tokens are drawn from the SAME maxOutputTokens budget as the actual
-     answer. For a simple structured-extraction task this was silently
-     eating most of the 800-token budget, leaving too little room to
-     finish the JSON object -> "Unterminated string" parse errors, which
-     then burned extra retries and helped trip the rate limit. Thinking
-     is now explicitly disabled for this call, and maxOutputTokens raised
-     as a safety margin. 429 responses now also log the response body so
-     RPM/TPM/RPD can be told apart from the logs alone.
-  9. Free-tier Gemini text quota for this project is very tight (checked
-     in AI Studio -> Rate Limit: 5 RPM, 20 RPD). RPD resets at midnight
-     PACIFIC time specifically, not UTC/local, and once it's gone no
-     amount of backoff helps until the reset. Rather than discover this
-     via repeated 429s, the script now keeps its own persistent, Pacific-
-     time-aware counter of Gemini text calls (stored in jobs.db) and
-     proactively stops calling Gemini once GEMINI_DAILY_TEXT_LIMIT is hit
-     for the day -- deferring remaining jobs to the next run/day using
-     the same safe "leave unmarked, retry later" pattern already used for
-     429s. This keeps the whole pipeline inside the free tier without
-     needing to link a billing account.
+  8. [Historical -- Gemini text only] gemini-2.5-flash had "dynamic thinking"
+     ON by default, which silently ate the maxOutputTokens budget. Not
+     applicable to the current Groq text model (see migration note below),
+     but kept here since generate_job_image() below still calls Gemini.
+  9. [Historical -- Gemini text only] Gemini's free-tier text quota was tight
+     (5 RPM / 20 RPD) with a Pacific-midnight reset, so the script kept its
+     own persistent, timezone-aware call counter. Superseded by FIX #11 below
+     now that text generation runs on Groq, whose free tiers are far larger
+     and whose reset is a rolling window rather than a fixed clock time.
   10. WEST BENGAL ELIGIBILITY FILTER. Many recruitment notices on this feed
       are state PSC / state government posts that are only open to
       residents/domicile-holders of ONE particular state (e.g. an MP or
       Rajasthan state government vacancy) -- useless to broadcast to a WB
-      exam-aspirant audience, since they cannot actually apply. Gemini now
-      also returns an "eligibility_scope" field alongside the other job
-      fields (ALL_INDIA / WEST_BENGAL / OTHER_STATE_ONLY / UNCLEAR), using
-      the SAME text call already spent on field extraction -- so this costs
-      zero extra Gemini quota. Jobs classified as ALL_INDIA (central govt,
-      banking, railways, defence, PSU, or a state job explicitly open to
-      all-India applicants) or WEST_BENGAL (WB's own state jobs) are
-      broadcast as before. Anything classified OTHER_STATE_ONLY or UNCLEAR
-      is skipped -- and skipped BEFORE the quota-expensive image-generation
-      step ever runs. Skipped items are marked "seen" immediately (their
-      eligibility isn't going to change on a future run), so we never waste
-      a future Gemini call re-checking the same notice.
+      exam-aspirant audience, since they cannot actually apply. The text
+      model also returns an "eligibility_scope" field alongside the other
+      job fields (ALL_INDIA / WEST_BENGAL / OTHER_STATE_ONLY / UNCLEAR), using
+      the SAME call already spent on field extraction -- so this costs zero
+      extra quota. Jobs classified ALL_INDIA or WEST_BENGAL are broadcast as
+      before; OTHER_STATE_ONLY or UNCLEAR is skipped, BEFORE the
+      quota-expensive image-generation step ever runs, and marked "seen"
+      immediately (their eligibility isn't going to change on a future run).
+
+  11. [NEW] GEMINI -> GROQ MIGRATION FOR TEXT/JSON EXTRACTION.
+      Field extraction + Bengali translation + eligibility classification
+      (extract_job_fields) now calls Groq's OpenAI-compatible Chat
+      Completions endpoint (https://api.groq.com/openai/v1/chat/completions)
+      instead of Gemini's generateContent endpoint. Image generation
+      (generate_job_image) is UNCHANGED and still calls Gemini -- these are
+      now two fully independent providers with two independent quotas, so
+      exhausting one never blocks the other. Concretely:
+        - New env var GROQ_API_KEY (separate from GEMINI_API_KEY, which is
+          now used ONLY for image generation).
+        - New GROQ_TEXT_MODEL (default "llama-3.3-70b-versatile"), sent as a
+          "model" field in the request body rather than baked into the URL.
+        - JSON is requested via response_format={"type": "json_object"}
+          (Groq's "JSON Object Mode") instead of Gemini's responseMimeType.
+        - Groq returns live quota info on every response via
+          x-ratelimit-remaining-requests / -limit-requests (always RPD for
+          the model in use, despite the generic name) and
+          x-ratelimit-remaining-tokens / -limit-tokens (always TPM). These
+          are now logged for visibility on every call.
+        - On 429, Groq's retry-after header (seconds) is honored directly
+          when present, falling back to the same exponential backoff as
+          before when it isn't.
+        - The self-imposed daily counter (FIX #9) is kept as a soft safety
+          net (now UTC-day-keyed, table renamed groq_usage) but the default
+          GROQ_DAILY_TEXT_LIMIT is calibrated to Groq's free-tier RPD, which
+          is 1,000-14,400/day depending on model -- 50-700x Gemini's old
+          20/day -- so it should rarely if ever bind for this script's
+          typical volume (MAX_JOBS_PER_RUN=5 per run). Because Groq's real
+          reset is a rolling window rather than a fixed clock time, this
+          counter is a conservative approximation, not an exact mirror of
+          Groq's own bookkeeping; the existing 429 retry/backoff path (FIX
+          #7) is what actually handles the rare case where our estimate and
+          Groq's real state disagree.
 """
 
 import base64
@@ -62,8 +81,7 @@ import os
 import re
 import sqlite3
 import time
-from datetime import datetime
-from zoneinfo import ZoneInfo  # stdlib since Python 3.9, no extra install needed
+from datetime import datetime, timezone
 
 import requests
 from bs4 import BeautifulSoup
@@ -91,35 +109,53 @@ HEADERS = {
 # be launched from (important once this runs under cron/systemd).
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jobs.db")
 
-# FIX #4: Gemini model names change frequently. Override via env vars without
-# touching code. Before deploying, confirm these are still live for your key:
-#   curl "https://generativelanguage.googleapis.com/v1beta/models?key=$GEMINI_API_KEY"
-GEMINI_TEXT_MODEL = os.environ.get("GEMINI_TEXT_MODEL", "gemini-2.5-flash")
-GEMINI_IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
+# FIX #4 / #11: model names are env-overridable without touching code.
+#
+# TEXT (Groq) -- used for field extraction, Bengali translation, and WB
+# eligibility classification. Confirm current model IDs/limits before
+# deploying: https://console.groq.com/docs/models and
+# https://console.groq.com/docs/rate-limits (or your own account's
+# https://console.groq.com/settings/limits). Reasonable alternatives to the
+# default:
+#   - "llama-3.1-8b-instant"      -> much higher free RPD (14.4K vs 1K),
+#                                    lighter model; fine if translation/
+#                                    classification quality holds up.
+#   - "openai/gpt-oss-120b"       -> stronger reasoning for the eligibility
+#                                    classification step, same 1K free RPD.
+GROQ_TEXT_MODEL = os.environ.get("GROQ_TEXT_MODEL", "llama-3.3-70b-versatile")
+GROQ_TEXT_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
-GEMINI_TEXT_ENDPOINT = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_TEXT_MODEL}:generateContent"
+# IMAGE (Gemini) -- unchanged, still generates the banner card. Fully
+# independent provider/quota from the Groq text calls above.
+GEMINI_IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
 GEMINI_IMAGE_ENDPOINT = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_IMAGE_MODEL}:generateContent"
 
-# FIX #7: tunable rate-limit handling. These are:
-#   - GEMINI_RATE_LIMIT_DELAY: pause between *successful* calls, to avoid
-#     tripping the per-minute limit in the first place.
-#   - GEMINI_RETRY_BASE_DELAY + GEMINI_MAX_RETRIES: exponential backoff when
-#     a 429 does happen (base * 2^(attempt-1): e.g. 20s, 40s, 80s).
+# FIX #7: tunable rate-limit handling for the Groq TEXT calls. These are:
+#   - GROQ_RATE_LIMIT_DELAY: pause between *successful* calls, to avoid
+#     tripping the per-minute limit in the first place (free tier is
+#     30 RPM for most models -> roughly 1 call every 2s at full throttle;
+#     the default below leaves comfortable headroom).
+#   - GROQ_RETRY_BASE_DELAY + GROQ_MAX_RETRIES: exponential backoff when a
+#     429 happens AND Groq didn't give us a retry-after header (e.g. 20s,
+#     40s, 80s). When retry-after IS present, that value is used instead.
 #   - MAX_JOBS_PER_RUN: caps how many new items are processed per run.
 #     Unprocessed items are simply left unmarked and picked up next run.
-GEMINI_RATE_LIMIT_DELAY = int(os.environ.get("GEMINI_RATE_LIMIT_DELAY", "20"))
-GEMINI_RETRY_BASE_DELAY = int(os.environ.get("GEMINI_RETRY_BASE_DELAY", "20"))
-GEMINI_MAX_RETRIES = int(os.environ.get("GEMINI_MAX_RETRIES", "3"))
+GROQ_RATE_LIMIT_DELAY = int(os.environ.get("GROQ_RATE_LIMIT_DELAY", "3"))
+GROQ_RETRY_BASE_DELAY = int(os.environ.get("GROQ_RETRY_BASE_DELAY", "20"))
+GROQ_MAX_RETRIES = int(os.environ.get("GROQ_MAX_RETRIES", "3"))
 MAX_JOBS_PER_RUN = int(os.environ.get("MAX_JOBS_PER_RUN", "5"))
 
-# FIX #9: self-enforced daily budget for Gemini TEXT calls, matching your
-# free-tier project's observed RPD in https://aistudio.google.com/rate-limit
-# (5 RPM / 20 RPD at time of writing). Adjust if your dashboard shows a
-# different number, or lower it a bit (e.g. 18) if you want a safety
-# margin. Google resets RPD at midnight PACIFIC time, hence the timezone
-# handling below rather than just using UTC or the server's local clock.
-GEMINI_DAILY_TEXT_LIMIT = int(os.environ.get("GEMINI_DAILY_TEXT_LIMIT", "20"))
-PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
+# FIX #9 / #11: self-imposed daily budget for Groq TEXT calls, as a soft
+# safety net on top of Groq's own quota. Default matches the free-tier RPD
+# for most Groq models (1,000/day per
+# https://console.groq.com/docs/rate-limits at time of writing) --
+# raise it if your GROQ_TEXT_MODEL has a higher published RPD (e.g. 14,400
+# for llama-3.1-8b-instant), or check your account's exact number at
+# https://console.groq.com/settings/limits. Unlike Gemini's fixed
+# Pacific-midnight reset, Groq's reset is a rolling window, so treat this as
+# an approximation -- the 429 retry/backoff logic above is the real
+# safety net if this estimate and Groq's actual state ever disagree.
+GROQ_DAILY_TEXT_LIMIT = int(os.environ.get("GROQ_DAILY_TEXT_LIMIT", "1000"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -145,12 +181,15 @@ def init_db() -> sqlite3.Connection:
         )
         """
     )
-    # FIX #9: persistent, Pacific-date-keyed counter of Gemini TEXT calls,
-    # so the free-tier daily budget survives across separate GitHub Actions
-    # runs (each run is a fresh process with no in-memory state otherwise).
+    # FIX #9/#11: persistent, UTC-date-keyed counter of Groq TEXT calls, so
+    # the self-imposed daily budget survives across separate process runs
+    # (each cron/GitHub Actions run is a fresh process with no in-memory
+    # state otherwise). Renamed from the old gemini_usage table -- if this
+    # DB previously ran the Gemini-text version of this script, that old
+    # table is simply left behind, unused, and harmless.
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS gemini_usage (
+        CREATE TABLE IF NOT EXISTS groq_usage (
             usage_date TEXT PRIMARY KEY,
             text_calls INTEGER NOT NULL DEFAULT 0
         )
@@ -170,25 +209,25 @@ def mark_job_seen(conn: sqlite3.Connection, url: str, title: str, source: str) -
     )
     conn.commit()
 
-def _pacific_today_str() -> str:
-    return datetime.now(PACIFIC_TZ).strftime("%Y-%m-%d")
+def _utc_today_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 def get_text_calls_today(conn: sqlite3.Connection) -> int:
-    """FIX #9: how many Gemini text calls have been made since the last
-    Pacific-midnight reset, per our own persistent tracking."""
+    """FIX #9/#11: how many Groq text calls have been made today (UTC),
+    per our own persistent, approximate tracking."""
     cur = conn.execute(
-        "SELECT text_calls FROM gemini_usage WHERE usage_date = ?",
-        (_pacific_today_str(),),
+        "SELECT text_calls FROM groq_usage WHERE usage_date = ?",
+        (_utc_today_str(),),
     )
     row = cur.fetchone()
     return row[0] if row else 0
 
 def increment_text_calls_today(conn: sqlite3.Connection) -> int:
-    """FIX #9: record that we're about to make one real Gemini text call."""
-    today = _pacific_today_str()
+    """FIX #9/#11: record that we're about to make one real Groq text call."""
+    today = _utc_today_str()
     conn.execute(
         """
-        INSERT INTO gemini_usage (usage_date, text_calls) VALUES (?, 1)
+        INSERT INTO groq_usage (usage_date, text_calls) VALUES (?, 1)
         ON CONFLICT(usage_date) DO UPDATE SET text_calls = text_calls + 1
         """,
         (today,),
@@ -198,16 +237,16 @@ def increment_text_calls_today(conn: sqlite3.Connection) -> int:
 
 
 # --------------------------------------------------------------------------
-# Gemini AI Layer (Text & Image Generation)
+# AI Layer: Groq (Text/JSON extraction) & Gemini (Image generation)
 # --------------------------------------------------------------------------
 
-# FIX #2: Ask Gemini for structured JSON fields instead of a finished HTML
-# string. This means Python (not the model) controls exactly how the final
-# Telegram message is assembled and escaped -- no more trusting an LLM to
-# never forget to escape a URL or insert stray text.
+# FIX #2: Ask the text model for structured JSON fields instead of a finished
+# HTML string. This means Python (not the model) controls exactly how the
+# final Telegram message is assembled and escaped -- no more trusting an LLM
+# to never forget to escape a URL or insert stray text.
 # FIX #10: "eligibility_scope" / "eligibility_reason" added so the same call
 # also tells us whether this job is actually usable by a West Bengal
-# audience, at no extra Gemini quota cost.
+# audience, at no extra quota cost.
 JOB_FIELD_KEYS = [
     "department", "post_name", "total_vacancies", "qualifications",
     "age_limit", "salary", "deadline", "apply_mode", "official_link",
@@ -220,7 +259,7 @@ JOB_FIELD_KEYS = [
 # is_eligible_for_wb() below.
 WB_RELEVANT_SCOPES = {"ALL_INDIA", "WEST_BENGAL"}
 
-def build_gemini_prompt(title: str, content: str) -> str:
+def build_extraction_prompt(title: str, content: str) -> str:
     return f"""You are analyzing a West Bengal government job recruitment notice for a
 Telegram channel whose audience is students in West Bengal preparing for
 competitive government exams.
@@ -269,87 +308,124 @@ For any text field where the detail is genuinely not present, use the Bengali
 string "বিজ্ঞপ্তি দেখুন". Do not translate or alter the official_link value."""
 
 
+def _log_groq_quota_headers(resp: requests.Response) -> None:
+    """FIX #11: Groq returns live quota info on every response (not just on
+    429s). Per Groq's docs, x-ratelimit-remaining-requests / -limit-requests
+    always refer to RPD (requests/day) for the model in use, and the
+    *-tokens headers always refer to TPM (tokens/minute) -- despite the
+    generic-sounding names. Logged here purely for visibility/debugging;
+    GROQ_DAILY_TEXT_LIMIT (checked before each call, above) is what actually
+    drives the stop-before-you-hit-it behavior, since Groq's real reset is a
+    rolling window rather than a fixed cutoff we could pre-compute exactly."""
+    rem_req = resp.headers.get("x-ratelimit-remaining-requests")
+    lim_req = resp.headers.get("x-ratelimit-limit-requests")
+    rem_tok = resp.headers.get("x-ratelimit-remaining-tokens")
+    reset_req = resp.headers.get("x-ratelimit-reset-requests")
+    if rem_req is not None:
+        logger.info(
+            f"Groq quota after this call: {rem_req}/{lim_req or '?'} requests/day left "
+            f"(resets in {reset_req or '?'}), {rem_tok or '?'} tokens/min left."
+        )
+
+
 def extract_job_fields(title: str, content: str, conn: sqlite3.Connection) -> dict | str | None:
-    """Returns a dict of fields, one of the sentinel strings
+    """FIX #11: calls Groq's OpenAI-compatible Chat Completions endpoint to
+    extract structured job fields (incl. eligibility_scope) as JSON.
+
+    Returns a dict of fields, one of the sentinel strings
     "RATE_LIMIT_EXHAUSTED" / "DAILY_BUDGET_REACHED", or None on failure."""
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
-        logger.error("GEMINI_API_KEY is not set.")
+        logger.error("GROQ_API_KEY is not set.")
         return None
 
+    request_headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
     payload = {
-        "contents": [{"parts": [{"text": build_gemini_prompt(title, content)}]}],
-        "generationConfig": {
-            "temperature": 0.2,
-            # FIX #8: raised from 800 -> 1500. TPM headroom is huge, so this
-            # costs nothing, but gives real output room to breathe.
-            "maxOutputTokens": 1500,
-            "responseMimeType": "application/json",
-            # FIX #8: gemini-2.5-flash has dynamic thinking ON by default,
-            # and those thinking tokens come out of maxOutputTokens BEFORE
-            # the actual JSON is written. Disabling it fixes the truncated-
-            # JSON errors and also uses less quota per call.
-            "thinkingConfig": {"thinkingBudget": 0},
-        },
+        "model": GROQ_TEXT_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a meticulous data-extraction assistant. Respond with "
+                    "ONLY a single valid JSON object -- no markdown code fences, no "
+                    "commentary, no text before or after the JSON."
+                ),
+            },
+            {"role": "user", "content": build_extraction_prompt(title, content)},
+        ],
+        "temperature": 0.2,
+        "max_completion_tokens": 1500,
+        # Groq's "JSON Object Mode": guarantees syntactically valid JSON
+        # (schema is still enforced by us below via the missing-keys check).
+        "response_format": {"type": "json_object"},
     }
 
     resp = None
-    for attempt in range(1, GEMINI_MAX_RETRIES + 1):
-        # FIX #9: proactively stop BEFORE spending an attempt if we've
-        # already used up today's self-tracked free-tier budget, instead
-        # of finding out via another 429.
+    for attempt in range(1, GROQ_MAX_RETRIES + 1):
+        # FIX #9/#11: proactively stop BEFORE spending an attempt if we've
+        # already used up today's self-imposed budget, instead of finding
+        # out via another 429.
         calls_today = get_text_calls_today(conn)
-        if calls_today >= GEMINI_DAILY_TEXT_LIMIT:
+        if calls_today >= GROQ_DAILY_TEXT_LIMIT:
             logger.warning(
-                f"Free-tier daily text budget reached ({calls_today}/{GEMINI_DAILY_TEXT_LIMIT} "
-                f"calls since the last Pacific-midnight reset). Stopping before attempt {attempt}."
+                f"Self-imposed daily text budget reached ({calls_today}/{GROQ_DAILY_TEXT_LIMIT} "
+                f"calls today, UTC). Stopping before attempt {attempt}."
             )
             return "DAILY_BUDGET_REACHED"
 
         try:
             increment_text_calls_today(conn)
-            resp = requests.post(f"{GEMINI_TEXT_ENDPOINT}?key={api_key}", json=payload, timeout=30)
+            resp = requests.post(GROQ_TEXT_ENDPOINT, headers=request_headers, json=payload, timeout=30)
+            _log_groq_quota_headers(resp)
 
             if resp.status_code == 429:
-                backoff = GEMINI_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                # FIX #8: log the actual response body. Gemini's 429 payload
-                # distinguishes RPM/TPM (short-lived, backoff is correct)
-                # from RPD (daily cap, resets at midnight Pacific).
+                retry_after = resp.headers.get("retry-after")
+                backoff = None
+                if retry_after is not None:
+                    try:
+                        backoff = float(retry_after)
+                    except ValueError:
+                        backoff = None
+                if backoff is None:
+                    backoff = GROQ_RETRY_BASE_DELAY * (2 ** (attempt - 1))
                 logger.warning(
-                    f"Attempt {attempt}/{GEMINI_MAX_RETRIES}: Gemini text generation "
+                    f"Attempt {attempt}/{GROQ_MAX_RETRIES}: Groq text generation "
                     f"rate-limited (429): {resp.text[:300]}. Sleeping {backoff}s..."
                 )
                 time.sleep(backoff)
                 continue
 
             if resp.status_code != 200:
-                logger.error(f"Gemini Text API Error {resp.status_code}: {resp.text}")
+                logger.error(f"Groq Text API Error {resp.status_code}: {resp.text}")
                 resp.raise_for_status()
 
             data = resp.json()
-            candidates = data.get("candidates")
-            if not candidates or not candidates[0].get("content"):
-                logger.error(f"Gemini returned no usable content (likely safety block): {data}")
+            choices = data.get("choices")
+            if not choices or not choices[0].get("message", {}).get("content"):
+                logger.error(f"Groq returned no usable content (possibly filtered): {data}")
                 return None
 
-            raw_text = candidates[0]["content"]["parts"][0]["text"].strip()
-            # Defensive: strip accidental ```json fences even though we asked
-            # for raw JSON via responseMimeType.
+            raw_text = choices[0]["message"]["content"].strip()
+            # Defensive: strip accidental ```json fences even though JSON
+            # Object Mode shouldn't produce them.
             raw_text = re.sub(r"^```(?:json)?|```$", "", raw_text, flags=re.MULTILINE).strip()
 
             fields = json.loads(raw_text)
             missing = [k for k in JOB_FIELD_KEYS if k not in fields]
             if missing:
-                logger.warning(f"Gemini JSON missing keys {missing}; filling defaults.")
+                logger.warning(f"Groq JSON missing keys {missing}; filling defaults.")
                 for k in missing:
                     fields[k] = ""
             return fields
 
         except json.JSONDecodeError as e:
-            logger.error(f"Gemini did not return valid JSON on attempt {attempt}: {e}")
+            logger.error(f"Groq did not return valid JSON on attempt {attempt}: {e}")
             time.sleep(10)
         except (requests.exceptions.RequestException, KeyError, IndexError, ValueError) as e:
-            logger.error(f"Gemini Text API parsing error on attempt {attempt}: {e}")
+            logger.error(f"Groq Text API parsing error on attempt {attempt}: {e}")
             time.sleep(10)
 
     if resp is not None and resp.status_code == 429:
@@ -359,8 +435,8 @@ def extract_job_fields(title: str, content: str, conn: sqlite3.Connection) -> di
 
 
 def is_eligible_for_wb(fields: dict) -> bool:
-    """FIX #10: True only if Gemini classified this notice as either an
-    all-India / central recruitment, or a West Bengal state job. A job
+    """FIX #10: True only if the text model classified this notice as either
+    an all-India / central recruitment, or a West Bengal state job. A job
     classified "OTHER_STATE_ONLY" (a state PSC/state government post
     restricted to that other state's own domicile-holders, e.g. an MP or
     Rajasthan state-only vacancy) is not something a WB student can actually
@@ -371,8 +447,8 @@ def is_eligible_for_wb(fields: dict) -> bool:
     eligible. This fails closed on purpose: it's better to silently skip a
     possibly-relevant post than to broadcast a job WB students may not even
     qualify for. If you notice too many false negatives in the logs, tune
-    the eligibility_scope instructions in build_gemini_prompt() rather than
-    loosening this check.
+    the eligibility_scope instructions in build_extraction_prompt() rather
+    than loosening this check.
     """
     scope = str(fields.get("eligibility_scope") or "").strip().upper()
     return scope in WB_RELEVANT_SCOPES
@@ -404,7 +480,10 @@ def build_telegram_message(fields: dict) -> str:
 
 
 def generate_job_image(title: str, content: str) -> bytes | None:
-    """Generates a modern AI banner image featuring Bengali typography for the job post."""
+    """UNCHANGED (FIX #11): still generates the AI banner image via Gemini.
+    Fully independent provider/quota from the Groq text calls above -- image
+    generation exhausting its quota never blocks text extraction, and
+    vice versa."""
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         return None
@@ -429,18 +508,18 @@ def generate_job_image(title: str, content: str) -> bytes | None:
         }
     }
 
-    # Image generation uses a separate quota bucket from the text model
-    # ("Nano Banana" in AI Studio's Rate Limit page), so it's tracked
-    # independently and shares the same exponential backoff treatment --
-    # but capped at 2 attempts since the image is best-effort (the text
-    # message still gets sent without one).
-    image_max_retries = min(GEMINI_MAX_RETRIES, 2)
+    # Image generation (Gemini, "Nano Banana" in AI Studio's Rate Limit
+    # page) is a completely separate quota bucket from the Groq text calls
+    # above, so it's tracked/retried independently -- capped at 2 attempts
+    # since the image is best-effort (the text message still gets sent
+    # without one).
+    image_max_retries = min(GROQ_MAX_RETRIES, 2)
     for attempt in range(1, image_max_retries + 1):
         try:
             resp = requests.post(f"{GEMINI_IMAGE_ENDPOINT}?key={api_key}", json=payload, timeout=45)
 
             if resp.status_code == 429:
-                backoff = GEMINI_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                backoff = GROQ_RETRY_BASE_DELAY * (2 ** (attempt - 1))
                 logger.warning(
                     f"Attempt {attempt}/{image_max_retries}: Gemini Image API rate-limited (429): "
                     f"{resp.text[:300]}. Sleeping {backoff}s..."
@@ -548,13 +627,13 @@ def scrape_site(session: requests.Session, site_name: str, url: str, conn: sqlit
     items = soup.find_all("item")
     logger.info(f"[{site_name}] Scanned {len(items)} items in RSS feed.")
 
-    # FIX #9: surface today's budget status once at the top of each run,
+    # FIX #9/#11: surface today's budget status once at the top of each run,
     # so it's visible in the log even if every item gets skipped for
     # other reasons (already-seen, keyword mismatch, etc.).
     calls_today = get_text_calls_today(conn)
     logger.info(
-        f"Gemini text budget today (since last Pacific-midnight reset): "
-        f"{calls_today}/{GEMINI_DAILY_TEXT_LIMIT} used."
+        f"Groq text budget today (UTC, self-imposed): "
+        f"{calls_today}/{GROQ_DAILY_TEXT_LIMIT} used."
     )
 
     seen_this_run = set()
@@ -580,9 +659,9 @@ def scrape_site(session: requests.Session, site_name: str, url: str, conn: sqlit
                 continue
 
             # FIX #7: stop after MAX_JOBS_PER_RUN so a big backlog can't burn
-            # the whole daily/per-minute Gemini quota in a single run. Items
-            # left unprocessed here are NOT marked as seen, so they'll be
-            # picked up automatically on the next scheduled run.
+            # the whole daily/per-minute quota in a single run. Items left
+            # unprocessed here are NOT marked as seen, so they'll be picked
+            # up automatically on the next scheduled run.
             if processed_this_run >= MAX_JOBS_PER_RUN:
                 logger.info(
                     f"[{site_name}] Reached MAX_JOBS_PER_RUN={MAX_JOBS_PER_RUN} for this run; "
@@ -616,31 +695,31 @@ def scrape_site(session: requests.Session, site_name: str, url: str, conn: sqlit
                 # 2. Extract plain text
                 article_text = article_soup.get_text(separator="\n", strip=True)
 
-                # 3. Append extracted links for Gemini analysis
+                # 3. Append extracted links for the model's analysis
                 if external_links:
                     unique_links = list(dict.fromkeys(external_links))[:5]
                     article_text += "\n\nPOSSIBLE OFFICIAL LINKS FOUND:\n" + "\n".join(unique_links)
 
             article_text = article_text[:4000]
 
-            # Extract structured fields (incl. eligibility_scope) via Gemini
+            # Extract structured fields (incl. eligibility_scope) via Groq
             fields = extract_job_fields(text, article_text, conn)
 
             if fields == "RATE_LIMIT_EXHAUSTED":
-                logger.error("Gemini rate-limited us (429) past our retries. Halting scraper run.")
+                logger.error("Groq rate-limited us (429) past our retries. Halting scraper run.")
                 return new_jobs_sent, True
 
             if fields == "DAILY_BUDGET_REACHED":
                 logger.error(
-                    "Free-tier daily text budget reached. Halting scraper run; remaining "
-                    "items will be retried after the next Pacific-midnight quota reset."
+                    "Self-imposed daily text budget reached. Halting scraper run; remaining "
+                    "items will be retried on the next run."
                 )
                 return new_jobs_sent, True
 
-            time.sleep(GEMINI_RATE_LIMIT_DELAY)
+            time.sleep(GROQ_RATE_LIMIT_DELAY)
 
             if not fields:
-                logger.warning(f"Gemini extraction failed for '{text[:50]}'; skipping.")
+                logger.warning(f"Groq extraction failed for '{text[:50]}'; skipping.")
                 continue
 
             # FIX #10: skip jobs that West Bengal students can't actually
@@ -648,7 +727,7 @@ def scrape_site(session: requests.Session, site_name: str, url: str, conn: sqlit
             # BEFORE spending anything on image generation or Telegram.
             # Mark as seen right away -- this is a permanent classification,
             # not a transient failure, so there's no reason to re-check it
-            # (and re-spend a Gemini call on it) on a future run.
+            # (and re-spend a Groq call on it) on a future run.
             if not is_eligible_for_wb(fields):
                 scope = fields.get("eligibility_scope", "UNCLEAR") or "UNCLEAR"
                 reason = (fields.get("eligibility_reason") or "").strip() or "no reason given"
@@ -661,7 +740,7 @@ def scrape_site(session: requests.Session, site_name: str, url: str, conn: sqlit
 
             bengali_message = build_telegram_message(fields)
 
-            # Generate AI Image Banner
+            # Generate AI Image Banner (Gemini)
             image_bytes = generate_job_image(text, article_text)
             if image_bytes:
                 time.sleep(5)  # Brief pause between AI calls
@@ -692,7 +771,7 @@ def main() -> None:
             new_jobs, quota_exhausted = scrape_site(session, site["name"], site["url"], conn)
             total_new += new_jobs
             if quota_exhausted:
-                logger.error("Stopping run early: Gemini quota exhausted.")
+                logger.error("Stopping run early: quota exhausted.")
                 break
             time.sleep(2)
     finally:
