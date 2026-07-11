@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import ipaddress
 import logging
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse, urlunparse
@@ -48,13 +47,6 @@ def validate_official_url(url: str, trusted_domains: set[str]) -> bool:
         or port not in {None, 443}
     ):
         return False
-    try:
-        address = ipaddress.ip_address(parsed.hostname)
-        if not address.is_global:
-            return False
-    except ValueError:
-        if parsed.hostname.lower() in {"localhost", "localhost.localdomain"}:
-            return False
     return hostname_is_trusted(parsed.hostname, trusted_domains)
 
 
@@ -128,9 +120,6 @@ class SafeFetcher:
                 current = urljoin(current, location)
                 continue
             response.raise_for_status()
-            declared = response.headers.get("Content-Length")
-            if declared and int(declared) > MAX_DOCUMENT_BYTES:
-                raise ValueError(f"official document exceeds {MAX_DOCUMENT_BYTES} bytes")
             if not validate_official_url(response.url, self.trusted_domains):
                 raise ValueError(f"untrusted final URL: {response.url}")
             return response, chain

@@ -7,8 +7,6 @@ from html.parser import HTMLParser
 
 import requests
 
-from processing.models import TelegramDeliveryState
-
 
 logger = logging.getLogger(__name__)
 CAPTION_LIMIT = 1024
@@ -20,8 +18,6 @@ class SendResult:
     success: bool
     photo_message_id: str | None = None
     text_message_id: str | None = None
-    state: TelegramDeliveryState = TelegramDeliveryState.NOT_SENT
-    error: str | None = None
 
 
 def should_split_caption(message: str) -> bool:
@@ -61,18 +57,15 @@ class TelegramSender:
         except (ValueError, KeyError, TypeError):
             return None
 
-    def send(
-        self, message: str, image: bytes | None, keyboard: dict | None = None,
-        previous_photo_id: str | None = None,
-    ) -> SendResult:
+    def send(self, message: str, image: bytes | None, keyboard: dict | None = None) -> SendResult:
         if self.dry_run:
             logger.info("telegram_skipped reason=dry_run message_chars=%s image=%s", len(message), bool(image))
-            return SendResult(True, state=TelegramDeliveryState.FULLY_SENT)
+            return SendResult(True)
         if not self.token or not self.channel_id:
             logger.error("telegram_failed reason=credentials_missing")
-            return SendResult(False, state=TelegramDeliveryState.FAILED, error="credentials missing")
-        photo_id: str | None = previous_photo_id
-        if image and not previous_photo_id:
+            return SendResult(False)
+        photo_id: str | None = None
+        if image:
             data: dict[str, object] = {"chat_id": self.channel_id}
             if not should_split_caption(message):
                 data.update({"caption": message, "parse_mode": "HTML"})
@@ -90,14 +83,13 @@ class TelegramSender:
                 photo_id = self._message_id(response)
                 if not should_split_caption(message):
                     logger.info("telegram_photo_sent message_id=%s", photo_id)
-                    return SendResult(True, photo_message_id=photo_id, state=TelegramDeliveryState.FULLY_SENT)
+                    return SendResult(True, photo_message_id=photo_id)
             except requests.RequestException as exc:
                 logger.exception("telegram_photo_failed error=%s; falling_back_to_text", exc)
         visible_length = telegram_text_length(message)
         if visible_length > MESSAGE_LIMIT:
             logger.error("telegram_text_failed reason=message_too_long visible_chars=%s", visible_length)
-            state = TelegramDeliveryState.PARTIAL_FAILURE if photo_id else TelegramDeliveryState.FAILED
-            return SendResult(False, photo_message_id=photo_id, state=state, error="message too long")
+            return SendResult(False, photo_message_id=photo_id)
         payload: dict[str, object] = {
             "chat_id": self.channel_id,
             "text": message,
@@ -111,12 +103,10 @@ class TelegramSender:
             response.raise_for_status()
             text_id = self._message_id(response)
             logger.info("telegram_text_sent message_id=%s", text_id)
-            state = TelegramDeliveryState.FULLY_SENT if photo_id else TelegramDeliveryState.TEXT_SENT
-            return SendResult(True, photo_message_id=photo_id, text_message_id=text_id, state=state)
+            return SendResult(True, photo_message_id=photo_id, text_message_id=text_id)
         except requests.RequestException as exc:
             logger.exception("telegram_text_failed error=%s", exc)
-            state = TelegramDeliveryState.PARTIAL_FAILURE if photo_id else TelegramDeliveryState.FAILED
-            return SendResult(False, photo_message_id=photo_id, state=state, error=str(exc))
+            return SendResult(False, photo_message_id=photo_id)
 
     def send_review(self, text: str) -> bool:
         chat_id = os.getenv("TELEGRAM_REVIEW_CHAT_ID", "").strip()
