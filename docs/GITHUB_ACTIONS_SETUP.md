@@ -19,8 +19,17 @@ Under **Variables**, add:
 - `MAX_ITEMS_PER_RUN=10`, `MAX_POSTS_PER_RUN=5`, `MAX_POSTS_PER_CATEGORY=2`
 - `AUTO_POST_ENABLED=true`
 - `DAILY_DIGEST_ENABLED=false` (change to `true` after testing the digest workflow)
-- `PUBLIC_WEBSITE_URL`, `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`
+- `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`
 - `VITE_TELEGRAM_CHANNEL_URL`, `CLOUDFLARE_PAGES_PROJECT`
+
+`PUBLIC_WEBSITE_URL` is **not required for the first setup**. Leave it absent or blank
+until Cloudflare completes the first deployment and shows your free `pages.dev` URL.
+Then create `PUBLIC_WEBSITE_URL` with that complete URL, for example
+`https://your-project.pages.dev`, and run the website workflow again. The same variable
+is used for Telegram website buttons, digest links, and the production sitemap.
+
+Without `PUBLIC_WEBSITE_URL`, the core pipeline still works. Telegram posts simply omit
+the website-details button, and the digest omits its website link.
 
 Run **Actions → Government Information Pipeline → Run workflow** with dry run first.
 The production concurrency group prevents overlapping publish runs. `jobs.db` is

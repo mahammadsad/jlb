@@ -7,10 +7,14 @@ Complete these in order. Keep every secret private; never paste one into a sourc
 3. Create a Telegram bot/channel using `TELEGRAM_SETUP.md`.
 4. In GitHub open the repository, click **Settings → Secrets and variables → Actions**.
 5. Add the secrets/variables listed in `GITHUB_ACTIONS_SETUP.md`.
-6. Deploy `web/` by following `CLOUDFLARE_PAGES_SETUP.md`.
-7. In GitHub click **Actions → Government Information Pipeline → Run workflow**.
-8. First choose **dry_run: true**. Download `dry-run-output` from the completed run.
-9. Inspect logs/cards. Then run without dry run only after trusted sources and Telegram are correct.
+   Skip `PUBLIC_WEBSITE_URL` for now—it does not exist yet.
+6. Deploy `web/` by following `CLOUDFLARE_PAGES_SETUP.md`. Cloudflare creates the
+   free `pages.dev` URL during this first deployment.
+7. Copy the new `pages.dev` URL into the GitHub variable `PUBLIC_WEBSITE_URL`, add it
+   to Cloudflare as `VITE_PUBLIC_WEBSITE_URL`, and redeploy the website once.
+8. In GitHub click **Actions → Government Information Pipeline → Run workflow**.
+9. First choose **dry_run: true**. Download `dry-run-output` from the completed run.
+10. Inspect logs/cards. Then run without dry run only after trusted sources and Telegram are correct.
 
 For an old database, first run a no-write check:
 
