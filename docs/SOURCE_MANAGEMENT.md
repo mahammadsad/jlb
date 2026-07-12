@@ -17,3 +17,10 @@ Before enabling a source:
 Full aggregator article inspection additionally requires `article_inspection=true`.
 It is fail-closed for uncertain robots access, caps redirects/bytes/links, ignores
 tracking/shortener links, and never treats article text as official evidence.
+
+Reviewed production sources are documented in
+[`SOURCE_AUDIT_WB_PORTAL.md`](SOURCE_AUDIT_WB_PORTAL.md) and
+[`SOURCE_AUDIT_WBJEEB.md`](SOURCE_AUDIT_WBJEEB.md). After merging a reviewed source
+change, run **Actions → Sync Reviewed Source Registry → Run workflow** before the safe
+pipeline dry run. This updates source definitions without exposing the Supabase
+service-role key.

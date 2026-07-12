@@ -18,6 +18,7 @@ from sources.pdf_source import extract_pdf
 logger = logging.getLogger(__name__)
 SHORTENERS = {"bit.ly", "tinyurl.com", "t.co", "goo.gl", "cutt.ly", "shorturl.at"}
 MAX_DOCUMENT_BYTES = 20 * 1024 * 1024
+ROBOTS_TIMEOUT = 5
 
 
 def hostname_is_trusted(hostname: str | None, trusted_domains: set[str]) -> bool:
@@ -94,7 +95,11 @@ class SafeFetcher:
             return self._robots_cache[origin]
         robots_url = origin + "/robots.txt"
         try:
-            response = self.session.get(robots_url, timeout=self.timeout, allow_redirects=False)
+            response = self.session.get(
+                robots_url,
+                timeout=min(self.timeout, ROBOTS_TIMEOUT),
+                allow_redirects=False,
+            )
             if response.is_redirect or response.is_permanent_redirect:
                 allowed = False
             elif response.status_code >= 400:

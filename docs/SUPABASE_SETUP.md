@@ -36,6 +36,7 @@ is official. RLS denies review notes, logs, source checks, delivery state and ad
 Run new files in `supabase/migrations/` in filename order from the SQL Editor. The
 pipeline deliberately does not execute arbitrary DDL using a browser or anon key.
 
-After configuring the Supabase environment values locally, load the disabled starter
-catalogue once with `python scripts/sync_sources_to_supabase.py`. It is idempotent and
-keeps unreviewed sources disabled.
+Load reviewed source definitions with **GitHub Actions → Sync Reviewed Source Registry
+→ Run workflow**. The workflow uses the existing Supabase secrets and is idempotent;
+unreviewed sources remain disabled. Local operators with production environment values
+may instead run `python scripts/sync_sources_to_supabase.py`.

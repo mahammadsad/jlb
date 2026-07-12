@@ -206,6 +206,58 @@ def test_html_parsing_with_verified_selectors():
     assert items[0].discovery_url == "https://wb.gov.in/notice/1"
 
 
+def test_west_bengal_portal_listing_uses_official_pdf_and_date():
+    config = SourceConfig(
+        "West Bengal State Portal",
+        "https://wb.gov.in/documents-notification.aspx",
+        "html",
+        ["GOVERNMENT_ANNOUNCEMENT"],
+        official=True,
+        discovery_only=False,
+        allowed_domains=("wb.gov.in",),
+        item_selector="#ContentPlaceHolder1_gv > tr",
+        title_selector="td:first-child p",
+        link_selector="td:first-child > a[href]",
+        date_selector="td:nth-of-type(2)",
+    )
+
+    items = HTMLSource(config).parse(
+        (FIXTURES / "wb_portal_notifications.html").read_bytes(), config.url
+    )
+
+    assert len(items) == 1
+    assert items[0].title == "Latest official notice"
+    assert items[0].discovery_url == "https://wb.gov.in/upload/latest-notice.pdf"
+    assert items[0].candidate_official_links == [items[0].discovery_url]
+    assert "09-07-2026" in items[0].summary
+
+
+def test_wbjeeb_listing_accepts_only_the_exact_nic_document_host():
+    config = SourceConfig(
+        "WBJEEB",
+        "https://wbjeeb.nic.in/current-events/",
+        "html",
+        ["ADMISSION", "RESULT", "EXAMINATION", "EDUCATION_NOTICE"],
+        official=True,
+        discovery_only=False,
+        allowed_domains=("wbjeeb.nic.in", "cdnbbsr.s3waas.gov.in"),
+        item_selector=".doc-table tbody > tr",
+        title_selector="td:first-child > a[href]",
+        link_selector="td:first-child > a[href]",
+    )
+
+    items = HTMLSource(config).parse(
+        (FIXTURES / "wbjeeb_current_events.html").read_bytes(), config.url
+    )
+
+    assert len(items) == 1
+    assert items[0].title == "Notice regarding WBJEE counselling"
+    assert items[0].discovery_url == (
+        "https://cdnbbsr.s3waas.gov.in/official-bucket/notice.pdf"
+    )
+    assert items[0].official is True
+
+
 def make_pdf(text: str) -> bytes:
     document = fitz.open()
     page = document.new_page()
@@ -251,6 +303,8 @@ def test_groq_json_mode_and_malformed_retry(monkeypatch, tmp_path):
     assert extracted.category == NoticeCategory.JOB
     assert len(session.calls) == 2
     assert session.calls[-1][1]["json"]["response_format"] == {"type": "json_object"}
+    repair_prompt = session.calls[-1][1]["json"]["messages"][-1]["content"]
+    assert "previous response failed schema validation" in repair_prompt.lower()
     assert repo.get_usage("groq", "extract") == 2
     conn.close()
 
@@ -511,11 +565,16 @@ def test_evidence_source_and_official_link_consistency():
 
 def test_downloaded_official_pdf_url_is_self_authenticating_metadata():
     notice = job_notice()
+    official_url = "https://psc.wb.gov.in/notice-2026-07.pdf"
+    for metadata_field in (notice.issuing_authority, notice.notice_number, notice.notice_date):
+        metadata_field.source_url = official_url
+    for field_value in notice.fields.values():
+        field_value.source_url = official_url
     notice.fields["official_notification_url"] = EvidenceValue(
-        value="https://psc.wb.gov.in/notice.pdf",
+        value=official_url,
         evidence=None,
         evidence_page=None,
-        source_url="https://psc.wb.gov.in/notice.pdf",
+        source_url=official_url,
     )
     paged_text = "[PAGE 1]\n" + source_text().replace(
         " https://psc.wb.gov.in/notice.pdf", ""
@@ -525,7 +584,7 @@ def test_downloaded_official_pdf_url_is_self_authenticating_metadata():
         paged_text,
         TRUSTED,
         page_text={1: source_text()},
-        official_source_url="https://psc.wb.gov.in/notice.pdf",
+        official_source_url=official_url,
     )
     assert result.valid
 
