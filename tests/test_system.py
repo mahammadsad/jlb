@@ -206,6 +206,58 @@ def test_html_parsing_with_verified_selectors():
     assert items[0].discovery_url == "https://wb.gov.in/notice/1"
 
 
+def test_west_bengal_portal_listing_uses_official_pdf_and_date():
+    config = SourceConfig(
+        "West Bengal State Portal",
+        "https://wb.gov.in/documents-notification.aspx",
+        "html",
+        ["GOVERNMENT_ANNOUNCEMENT"],
+        official=True,
+        discovery_only=False,
+        allowed_domains=("wb.gov.in",),
+        item_selector="#ContentPlaceHolder1_gv > tr",
+        title_selector="td:first-child p",
+        link_selector="td:first-child > a[href]",
+        date_selector="td:nth-of-type(2)",
+    )
+
+    items = HTMLSource(config).parse(
+        (FIXTURES / "wb_portal_notifications.html").read_bytes(), config.url
+    )
+
+    assert len(items) == 1
+    assert items[0].title == "Latest official notice"
+    assert items[0].discovery_url == "https://wb.gov.in/upload/latest-notice.pdf"
+    assert items[0].candidate_official_links == [items[0].discovery_url]
+    assert "09-07-2026" in items[0].summary
+
+
+def test_wbjeeb_listing_accepts_only_the_exact_nic_document_host():
+    config = SourceConfig(
+        "WBJEEB",
+        "https://wbjeeb.nic.in/current-events/",
+        "html",
+        ["ADMISSION", "RESULT", "EXAMINATION", "EDUCATION_NOTICE"],
+        official=True,
+        discovery_only=False,
+        allowed_domains=("wbjeeb.nic.in", "cdnbbsr.s3waas.gov.in"),
+        item_selector=".doc-table tbody > tr",
+        title_selector="td:first-child > a[href]",
+        link_selector="td:first-child > a[href]",
+    )
+
+    items = HTMLSource(config).parse(
+        (FIXTURES / "wbjeeb_current_events.html").read_bytes(), config.url
+    )
+
+    assert len(items) == 1
+    assert items[0].title == "Notice regarding WBJEE counselling"
+    assert items[0].discovery_url == (
+        "https://cdnbbsr.s3waas.gov.in/official-bucket/notice.pdf"
+    )
+    assert items[0].official is True
+
+
 def make_pdf(text: str) -> bytes:
     document = fitz.open()
     page = document.new_page()

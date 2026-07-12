@@ -10,9 +10,10 @@ Complete these in order. Keep every secret private; never paste one into a sourc
 6. Set `PUBLIC_WEBSITE_URL` to
    `https://mahammadsad.github.io/telegram_job_alert_bot`.
 7. Enable and deploy the website using `GITHUB_PAGES_SETUP.md`.
-8. In GitHub click **Actions → Government Information Pipeline → Run workflow**.
-9. First choose **dry_run: true**. Download `dry-run-output` from the completed run.
-10. Inspect logs/cards. Then run without dry run only after trusted sources and Telegram are correct.
+8. Run **Actions → Sync Reviewed Source Registry → Run workflow**.
+9. Run **Actions → Government Information Pipeline → Run workflow**.
+10. First choose **dry_run: true**. Download `dry-run-output` from the completed run.
+11. Inspect logs/cards. Then run without dry run only after trusted sources and Telegram are correct.
 
 For an old database, first run a no-write check:
 

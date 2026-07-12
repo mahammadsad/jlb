@@ -25,6 +25,25 @@ class HTMLSource(BaseSource):
             link = urljoin(base_url, link_node["href"])
             if not source_url_is_allowed(link, self.config.allowed_domains):
                 continue
+            summary_node = (
+                node.select_one(self.config.summary_selector)
+                if self.config.summary_selector
+                else None
+            )
+            date_node = (
+                node.select_one(self.config.date_selector)
+                if self.config.date_selector
+                else None
+            )
+            summary = (
+                summary_node.get_text(" ", strip=True)
+                if summary_node
+                else node.get_text("\n", strip=True)
+            )
+            if date_node:
+                published_date = date_node.get_text(" ", strip=True)
+                if published_date and published_date not in summary:
+                    summary = f"{summary}\nPublished: {published_date}"
             results.append(
                 DiscoveredItem(
                     title=title_node.get_text(" ", strip=True),
@@ -32,7 +51,7 @@ class HTMLSource(BaseSource):
                     source_name=self.config.name,
                     source_domain=urlparse(link).hostname or "",
                     category_hints=categories,
-                    summary=node.get_text("\n", strip=True),
+                    summary=summary[:10000],
                     candidate_official_links=[link] if self.config.official else [],
                     official=self.config.official,
                     discovery_only=self.config.discovery_only,

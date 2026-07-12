@@ -7,6 +7,8 @@ trusted_domains:
   - wbbse.wb.gov.in
   - wbchse.wb.gov.in
   - wbjeeb.nic.in
+  # Exact NIC S3WaaS document host used by the official WBJEEB listing.
+  - cdnbbsr.s3waas.gov.in
   - scholarships.gov.in
   - results.gov.in
   - education.gov.in

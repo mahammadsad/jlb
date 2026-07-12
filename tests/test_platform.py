@@ -19,6 +19,7 @@ from processing.models import (
 )
 from processing.rule_extractor import extract_rule_facts
 from scripts.import_sqlite_to_supabase import import_database
+from scripts.sync_sources_to_supabase import build_source_payload
 from sources.article_source import ArticleInspector
 from sources.base import SourceConfig
 from telegram.sender import TelegramSender
@@ -53,6 +54,33 @@ def test_full_article_inspection_ranks_official_links_and_ignores_shorteners():
     text, links = ArticleInspector(config, {"psc.wb.gov.in"}, ArticleSession(markup)).inspect(config.url)
     assert "Official notification" in text
     assert links == ["https://psc.wb.gov.in/n.pdf"]
+
+
+def test_source_sync_preserves_reviewed_pdf_listing_metadata():
+    payload = build_source_payload({
+        "name": "West Bengal State Portal",
+        "slug": "west-bengal-state-portal",
+        "url": "https://wb.gov.in/documents-notification.aspx",
+        "parser_type": "html",
+        "source_type": "OFFICIAL_PDF_LIST",
+        "categories": ["GOVERNMENT_ANNOUNCEMENT"],
+        "official": True,
+        "discovery_only": False,
+        "enabled": True,
+        "allowed_domains": ["wb.gov.in"],
+        "item_selector": "#ContentPlaceHolder1_gv > tr",
+        "title_selector": "td:first-child p",
+        "link_selector": "td:first-child > a[href]",
+        "date_selector": "td:nth-of-type(2)",
+        "robots_status": "ALLOWED",
+        "terms_reviewed": True,
+        "selector_verified_at": "2026-07-12T00:00:00+05:30",
+    })
+
+    assert payload["source_type"] == "OFFICIAL_PDF_LIST"
+    assert payload["base_url"] == "https://wb.gov.in/documents-notification.aspx"
+    assert payload["date_selector"] == "td:nth-of-type(2)"
+    assert payload["terms_reviewed"] is True
 
 
 def test_article_inspection_stays_off_without_terms_review():

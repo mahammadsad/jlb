@@ -18,14 +18,28 @@ sources:
   # Disabled until each site's current listing selectors and terms have been
   # manually checked. Enabling a guessed scraper would create false notices.
   - name: West Bengal State Portal
-    url: https://wb.gov.in/
+    url: https://wb.gov.in/documents-notification.aspx
     parser_type: html
-    categories: [WELFARE_SCHEME, GOVERNMENT_ANNOUNCEMENT]
+    source_type: OFFICIAL_PDF_LIST
+    slug: west-bengal-state-portal
+    state: West Bengal
+    authority_type: State Government
+    categories: [GOVERNMENT_ANNOUNCEMENT, JOB, WELFARE_SCHEME, EDUCATION_NOTICE, GOVERNMENT_SERVICE]
     official: true
     discovery_only: false
-    enabled: false
-    parser_note: "Verify a stable public notice-list selector before enabling."
+    enabled: true
     allowed_domains: [wb.gov.in]
+    item_selector: "#ContentPlaceHolder1_gv > tr"
+    title_selector: "td:first-child p"
+    link_selector: "td:first-child > a[href]"
+    date_selector: "td:nth-of-type(2)"
+    min_interval_minutes: 360
+    request_timeout: 25
+    max_items: 3
+    robots_status: ALLOWED
+    terms_reviewed: true
+    selector_verified_at: "2026-07-12T00:00:00+05:30"
+    notes: "Official Government of West Bengal PDF listing. robots.txt allows all; selectors, Terms of Use and Copyright Policy reviewed 2026-07-12. Publish only verified PDF facts with prominent official-source links."
   - name: WB Public Service Commission
     url: https://psc.wb.gov.in/
     parser_type: html
@@ -63,14 +77,27 @@ sources:
     parser_note: "Verify notice-list selectors before enabling."
     allowed_domains: [wbchse.wb.gov.in]
   - name: WBJEEB
-    url: https://wbjeeb.nic.in/
+    url: https://wbjeeb.nic.in/current-events/
     parser_type: html
-    categories: [ADMISSION, RESULT, EXAMINATION]
+    source_type: OFFICIAL_PDF_LIST
+    slug: wbjeeb
+    state: West Bengal
+    authority_type: Statutory Examination Board
+    categories: [ADMISSION, RESULT, EXAMINATION, EDUCATION_NOTICE]
     official: true
     discovery_only: false
-    enabled: false
-    parser_note: "Verify notice-list selectors before enabling."
-    allowed_domains: [wbjeeb.nic.in]
+    enabled: true
+    allowed_domains: [wbjeeb.nic.in, cdnbbsr.s3waas.gov.in]
+    item_selector: ".doc-table tbody > tr"
+    title_selector: "td:first-child > a[href]"
+    link_selector: "td:first-child > a[href]"
+    min_interval_minutes: 360
+    request_timeout: 30
+    max_items: 3
+    robots_status: "ALLOWED_LISTING; DOCUMENT_CDN_NO_RESPONSE"
+    terms_reviewed: true
+    selector_verified_at: "2026-07-12T00:00:00+05:30"
+    notes: "Official WBJEEB current-events table hosted by NIC S3WaaS. Listing robots.txt allows this path; exact WBJEEB and NIC CDN hosts only. Two of the newest three PDFs passed text extraction on 2026-07-12; scanned PDFs remain manual-review-only."
 
   - name: Union Public Service Commission
     url: https://upsc.gov.in/
